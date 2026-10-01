@@ -20,7 +20,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-BOT_TOKEN = "BOT_TOKEN"
+BOT_TOKEN = "8992215082:AAHGy7xFhwLwd69cvRVyo6xiTcLwa3KTrXo"
 ADMIN_IDS = [5078387190]
 PAYMENT_PHONE = "+7 904 244 1770"
 STAR_PRICE = 1.4
