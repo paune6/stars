@@ -27,6 +27,9 @@ STAR_PRICE = 1.4
 MIN_STARS = 50
 MAX_STARS = 100000
 
+MIN_VIEWS = 1000
+MAX_VIEWS = 10_000_000
+
 STAR_OPTIONS = [50, 100, 150, 250, 350, 500, 750, 1000, 1500, 2500, 5000, 10000, 25000]
 
 PREMIUM_PLANS = {
@@ -35,10 +38,27 @@ PREMIUM_PLANS = {
     "12m": {"months": 12, "price": 3329, "label": "12 месяцев"},
 }
 
+# Цена указана за 1000 просмотров
+VIEWS_PLANS = {
+    "slow": {
+        "views": 1000,
+        "price": 0.18,
+        "label": "1000 просмотров (медленно)",
+        "short": "1000 просм. · медленно",
+    },
+    "medium": {
+        "views": 1000,
+        "price": 0.28,
+        "label": "1000 просмотров (средняя скорость, возможен недокрут)",
+        "short": "1000 просм. · средняя скор.",
+    },
+}
+
 START_PHOTO_URL = "https://i.ibb.co/zWbKBYyf/image.png"
 PHOTO_ORDERS    = "https://i.ibb.co/xSPCFp2f/image.png"
 PHOTO_STARS     = "https://i.ibb.co/kghWKtLr/image.png"
 PHOTO_PREMIUM   = "https://i.ibb.co/4whMc7qb/image.png"
+PHOTO_VIEWS     = "https://i.ibb.co/kghWKtLr/image.png"
 PHOTO_PROFILE   = "https://i.ibb.co/Ngk3Nx4t/image.png"
 
 logging.basicConfig(level=logging.INFO)
@@ -58,6 +78,11 @@ def fmt_price(stars: int) -> str:
 
 def fmt_num(n: int) -> str:
     return f"{n:,}".replace(",", " ")
+
+
+def calc_views_price(views_count: int, rate_key: str) -> float:
+    plan = VIEWS_PLANS[rate_key]
+    return round((views_count / 1000) * plan["price"], 2)
 
 
 def no_username_warning() -> str:
@@ -115,6 +140,8 @@ class Order:
     product_type: str
     stars_count: int = 0
     premium_plan: str = ""
+    views_plan: str = ""
+    views_count: int = 0
     total_price: float = 0.0
     screenshot_file_id: Optional[str] = None
     status: str = "pending"
@@ -125,12 +152,18 @@ class Order:
         if self.product_type == "premium":
             plan = PREMIUM_PLANS.get(self.premium_plan, {})
             return f"💎 Telegram Premium — {plan.get('label', '?')}"
+        if self.product_type == "views":
+            plan = VIEWS_PLANS.get(self.views_plan, {})
+            if self.views_count and self.views_count != plan.get("views", 0):
+                return f"👁 {fmt_num(self.views_count)} просмотров ({plan.get('short', '?')})"
+            return f"👁 {plan.get('label', '?')}"
         return f"⭐ {fmt_num(self.stars_count)} звёзд"
 
 
 def create_order(user_id: int, username: str, recipient_username: str,
                  recipient_id: Optional[int], is_gift: bool, product_type: str,
-                 stars_count: int = 0, premium_plan: str = "", total_price: float = 0.0) -> Order:
+                 stars_count: int = 0, premium_plan: str = "", views_plan: str = "",
+                 views_count: int = 0, total_price: float = 0.0) -> Order:
     global order_counter
     order_counter += 1
     order = Order(
@@ -143,6 +176,8 @@ def create_order(user_id: int, username: str, recipient_username: str,
         product_type=product_type,
         stars_count=stars_count,
         premium_plan=premium_plan,
+        views_plan=views_plan,
+        views_count=views_count,
         total_price=round(total_price, 2),
     )
     orders[order_counter] = order
@@ -186,8 +221,10 @@ def is_admin(user_id: int) -> bool:
 class OrderStates(StatesGroup):
     choosing_stars = State()
     choosing_premium = State()
+    choosing_views = State()
     waiting_for_recipient = State()
     waiting_for_custom_amount = State()
+    waiting_for_custom_views = State()
     waiting_for_screenshot = State()
 
 
@@ -234,10 +271,11 @@ def user_reply_kb() -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardBuilder()
     kb.button(text="⭐ Купить звёзды")
     kb.button(text="💎 Купить Premium")
+    kb.button(text="👁 Купить просмотры")
     kb.button(text="📋 Мои заявки")
     kb.button(text="👤 Профиль")
     kb.button(text="ℹ️ Помощь")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 2)
     return kb.as_markup(resize_keyboard=True, input_field_placeholder="Выберите действие 👇")
 
 
@@ -257,10 +295,11 @@ def main_menu_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="⭐ Купить звёзды", callback_data="buy_stars")
     kb.button(text="💎 Купить Premium", callback_data="buy_premium")
+    kb.button(text="👁 Купить просмотры", callback_data="buy_views")
     kb.button(text="📋 Мои заявки", callback_data="my_orders")
     kb.button(text="👤 Профиль", callback_data="profile")
     kb.button(text="ℹ️ Помощь", callback_data="help")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 2)
     return kb.as_markup()
 
 
@@ -294,6 +333,32 @@ def premium_grid_kb():
             callback_data=f"premium:{key}",
         )
     kb.button(text="⬅️ Назад", callback_data="buy_premium")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def views_grid_kb():
+    kb = InlineKeyboardBuilder()
+    for key, plan in VIEWS_PLANS.items():
+        kb.button(
+            text=f"👁 {plan['short']} · {fmt_price_value(plan['price'])}",
+            callback_data=f"views:{key}",
+        )
+    kb.button(text="⚙️ Своё количество", callback_data="views:custom")
+    kb.button(text="⬅️ Назад", callback_data="buy_views")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def views_rate_kb(views_count: int):
+    kb = InlineKeyboardBuilder()
+    for key, plan in VIEWS_PLANS.items():
+        total = calc_views_price(views_count, key)
+        kb.button(
+            text=f"👁 {plan['short']} · {fmt_price_value(total)}",
+            callback_data=f"views_rate:{key}",
+        )
+    kb.button(text="⬅️ Назад", callback_data="buy_views")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -361,10 +426,12 @@ async def cmd_start(message: Message, state: FSMContext):
         caption=(
             f"✨ <b>Добро пожаловать в Miller Stars!</b>\n"
             f"{DIV}\n"
-            f"🌟 Покупайте звёзды и Telegram Premium\n"
-            f"быстро и безопасно.\n\n"
+            f"🌟 Покупайте звёзды, Telegram Premium\n"
+            f"и просмотры быстро и безопасно.\n\n"
             f"💎 <b>Курс звёзд:</b> {STAR_PRICE} ₽ за 1 звезду\n"
-            f"📦 <b>Минимум:</b> {MIN_STARS} звёзд\n"
+            f"👁 <b>Просмотры:</b> от 0,18 ₽ за 1000\n"
+            f"    (минимум {fmt_num(MIN_VIEWS)} просмотров)\n"
+            f"📦 <b>Минимум звёзд:</b> {MIN_STARS}\n"
             f"📱 <b>Оплата:</b> по номеру телефона\n"
             f"{DIV}\n"
             f"Выберите действие в меню ниже 👇"
@@ -414,6 +481,28 @@ async def rb_buy_premium(message: Message, state: FSMContext):
             f"Выберите, кому хотите купить Premium 👇"
         ),
         reply_markup=buy_type_kb("premium"),
+    )
+
+
+@user_router.message(F.text == "👁 Купить просмотры")
+async def rb_buy_views(message: Message, state: FSMContext):
+    await state.clear()
+    register_user(message.from_user.id, message.from_user.username)
+    if maintenance_mode and not is_admin(message.from_user.id):
+        await message.answer("🔧 Бот на тех. обслуживании. Попробуйте позже.")
+        return
+
+    if not check_username(message.from_user):
+        await message.answer(no_username_warning(), reply_markup=user_reply_kb())
+        return
+
+    await message.answer_photo(
+        photo=PHOTO_VIEWS,
+        caption=(
+            f"👁 <b>Покупка просмотров</b>\n{DIV}\n"
+            f"Выберите, кому хотите купить просмотры 👇"
+        ),
+        reply_markup=buy_type_kb("views"),
     )
 
 
@@ -467,27 +556,34 @@ async def rb_profile(message: Message):
     )
 
 
+HELP_TEXT = (
+    f"ℹ️ <b>Помощь</b>\n{DIV}\n"
+    f"<b>Как купить:</b>\n"
+    f"1️⃣ Нажмите «⭐ Купить звёзды», «💎 Купить Premium»\n"
+    f"    или «👁 Купить просмотры»\n"
+    f"2️⃣ Выберите «Купить себе» или «Подарить»\n"
+    f"3️⃣ Укажите количество/план/тариф\n"
+    f"4️⃣ Переведите сумму на номер:\n"
+    f"    <code>{PAYMENT_PHONE}</code>\n"
+    f"5️⃣ Отправьте скриншот перевода боту\n"
+    f"6️⃣ Ожидайте зачисления ⏳\n"
+    f"{DIV}\n"
+    f"⭐ <b>Звёзды:</b> {STAR_PRICE} ₽ за 1 шт (мин. {MIN_STARS})\n"
+    f"💎 <b>Premium 3 мес:</b> {fmt_price_value(1230)}\n"
+    f"💎 <b>Premium 6 мес:</b> {fmt_price_value(1859)}\n"
+    f"💎 <b>Premium 12 мес:</b> {fmt_price_value(3329)}\n"
+    f"👁 <b>1000 просмотров (медленно):</b> {fmt_price_value(0.18)}\n"
+    f"👁 <b>1000 просмотров (средняя скор.):</b> {fmt_price_value(0.28)}\n"
+    f"📉 <b>Минимум просмотров:</b> {fmt_num(MIN_VIEWS)}\n"
+    f"{DIV}\n"
+    f"❓ По вопросам — обратитесь к администратору."
+)
+
+
 @user_router.message(F.text == "ℹ️ Помощь")
 async def rb_help(message: Message):
     register_user(message.from_user.id, message.from_user.username)
-    await message.answer(
-        f"ℹ️ <b>Помощь</b>\n{DIV}\n"
-        f"<b>Как купить:</b>\n"
-        f"1️⃣ Нажмите «⭐ Купить звёзды» или «💎 Купить Premium»\n"
-        f"2️⃣ Выберите «Купить себе» или «Подарить»\n"
-        f"3️⃣ Укажите количество/план\n"
-        f"4️⃣ Переведите сумму на номер:\n"
-        f"    <code>{PAYMENT_PHONE}</code>\n"
-        f"5️⃣ Отправьте скриншот перевода боту\n"
-        f"6️⃣ Ожидайте зачисления ⏳\n"
-        f"{DIV}\n"
-        f"💎 <b>Звёзды:</b> {STAR_PRICE} ₽ за 1 шт\n"
-        f"💎 <b>Premium 3 мес:</b> {fmt_price_value(1230)}\n"
-        f"💎 <b>Premium 6 мес:</b> {fmt_price_value(1859)}\n"
-        f"💎 <b>Premium 12 мес:</b> {fmt_price_value(3329)}\n"
-        f"{DIV}\n"
-        f"❓ По вопросам — обратитесь к администратору."
-    )
+    await message.answer(HELP_TEXT)
 
 
 @user_router.callback_query(F.data == "main_menu")
@@ -499,6 +595,7 @@ async def main_menu(call: CallbackQuery, state: FSMContext):
         f"🏠 <b>Главное меню</b>\n{DIV}\n"
         f"⭐ Звёзды: <b>{STAR_PRICE} ₽</b> за 1 шт\n"
         f"💎 Premium: <b>от 1 230 ₽</b>\n"
+        f"👁 Просмотры: <b>от 0,18 ₽</b> / 1000\n"
         f"📱 Оплата: <code>{PAYMENT_PHONE}</code>",
         reply_markup=main_menu_kb(),
     )
@@ -534,22 +631,7 @@ async def cb_help(call: CallbackQuery):
     register_user(call.from_user.id, call.from_user.username)
     await safe_edit(
         call.message,
-        f"ℹ️ <b>Помощь</b>\n{DIV}\n"
-        f"<b>Как купить:</b>\n"
-        f"1️⃣ Нажмите «⭐ Купить звёзды» или «💎 Купить Premium»\n"
-        f"2️⃣ Выберите «Купить себе» или «Подарить»\n"
-        f"3️⃣ Укажите количество/план\n"
-        f"4️⃣ Переведите сумму на номер:\n"
-        f"    <code>{PAYMENT_PHONE}</code>\n"
-        f"5️⃣ Отправьте скриншот перевода боту\n"
-        f"6️⃣ Ожидайте зачисления ⏳\n"
-        f"{DIV}\n"
-        f"💎 <b>Звёзды:</b> {STAR_PRICE} ₽ за 1 шт\n"
-        f"💎 <b>Premium 3 мес:</b> {fmt_price_value(1230)}\n"
-        f"💎 <b>Premium 6 мес:</b> {fmt_price_value(1859)}\n"
-        f"💎 <b>Premium 12 мес:</b> {fmt_price_value(3329)}\n"
-        f"{DIV}\n"
-        f"❓ По вопросам — обратитесь к администратору.",
+        HELP_TEXT,
         reply_markup=back_to_main_kb(),
     )
     await call.answer()
@@ -601,6 +683,29 @@ async def buy_premium(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+@user_router.callback_query(F.data == "buy_views")
+async def buy_views(call: CallbackQuery, state: FSMContext):
+    register_user(call.from_user.id, call.from_user.username)
+    await state.clear()
+    if maintenance_mode and not is_admin(call.from_user.id):
+        await call.answer("🔧 Бот на тех. обслуживании", show_alert=True)
+        return
+
+    if not check_username(call.from_user):
+        await safe_edit(call.message, no_username_warning(), reply_markup=back_to_main_kb())
+        await call.answer("❗ Установите @username!", show_alert=True)
+        return
+
+    await safe_edit(
+        call.message,
+        f"👁 <b>Покупка просмотров</b>\n{DIV}\n"
+        f"Выберите, кому хотите купить просмотры 👇",
+        reply_markup=buy_type_kb("views"),
+        photo=PHOTO_VIEWS,
+    )
+    await call.answer()
+
+
 def grid_text_stars(recipient_display: str) -> str:
     return (
         f"⭐ <b>Покупка звёзд</b>\n"
@@ -630,13 +735,33 @@ def grid_text_premium(recipient_display: str) -> str:
     )
 
 
+def grid_text_views(recipient_display: str) -> str:
+    return (
+        f"👁 <b>Покупка просмотров</b>\n"
+        f"{DIV}\n"
+        f"👤 Получатель: <b>{recipient_display}</b>\n"
+        f"{DIV}\n"
+        f"📉 Минимум: <b>{fmt_num(MIN_VIEWS)}</b> просмотров\n"
+        f"{DIV}\n"
+        f"📦 Доступные тарифы:\n"
+        f"   👁 1000 просмотров (медленно) — {fmt_price_value(0.18)}\n"
+        f"   👁 1000 просмотров (средняя скорость,\n"
+        f"       возможен недокрут) — {fmt_price_value(0.28)}\n"
+        f"{DIV}\n"
+        f"🔍 Выберите тариф или «⚙️ Своё количество» 👇"
+    )
+
+
 async def _start_product_flow(call: CallbackQuery, state: FSMContext, product: str):
     user = call.from_user
     display = f"@{user.username}" if user.username else user.full_name
 
-    await state.set_state(
-        OrderStates.choosing_stars if product == "stars" else OrderStates.choosing_premium
-    )
+    product_state = {
+        "stars": OrderStates.choosing_stars,
+        "premium": OrderStates.choosing_premium,
+        "views": OrderStates.choosing_views,
+    }
+    await state.set_state(product_state[product])
     await state.update_data(
         product_type=product,
         recipient_username=user.username or "",
@@ -645,8 +770,15 @@ async def _start_product_flow(call: CallbackQuery, state: FSMContext, product: s
         recipient_display=display,
     )
 
-    text = grid_text_stars(display) if product == "stars" else grid_text_premium(display)
-    markup = stars_grid_kb() if product == "stars" else premium_grid_kb()
+    if product == "stars":
+        text = grid_text_stars(display)
+        markup = stars_grid_kb()
+    elif product == "premium":
+        text = grid_text_premium(display)
+        markup = premium_grid_kb()
+    else:
+        text = grid_text_views(display)
+        markup = views_grid_kb()
 
     await safe_edit(call.message, text, reply_markup=markup)
     await call.answer()
@@ -680,6 +812,21 @@ async def premium_self(call: CallbackQuery, state: FSMContext):
         return
 
     await _start_product_flow(call, state, "premium")
+
+
+@user_router.callback_query(F.data == "views_self")
+async def views_self(call: CallbackQuery, state: FSMContext):
+    register_user(call.from_user.id, call.from_user.username)
+    if maintenance_mode and not is_admin(call.from_user.id):
+        await call.answer("🔧 Бот на тех. обслуживании", show_alert=True)
+        return
+
+    if not check_username(call.from_user):
+        await safe_edit(call.message, no_username_warning(), reply_markup=back_to_main_kb())
+        await call.answer("❗ Установите @username!", show_alert=True)
+        return
+
+    await _start_product_flow(call, state, "views")
 
 
 @user_router.callback_query(F.data == "stars_gift")
@@ -727,6 +874,32 @@ async def premium_gift(call: CallbackQuery, state: FSMContext):
         f"🎁 <b>Подарить Premium</b>\n{DIV}\n"
         f"🔎 Введите юзернейм пользователя,\n"
         f"которому будем дарить Premium:\n\n"
+        f"📌 <i>Пример:</i> <code>@username</code>\n"
+        f"{DIV}\n"
+        f"⚠️ Пользователь должен был запустить бота."
+    )
+    await call.answer()
+
+
+@user_router.callback_query(F.data == "views_gift")
+async def views_gift(call: CallbackQuery, state: FSMContext):
+    register_user(call.from_user.id, call.from_user.username)
+    if maintenance_mode and not is_admin(call.from_user.id):
+        await call.answer("🔧 Бот на тех. обслуживании", show_alert=True)
+        return
+
+    if not check_username(call.from_user):
+        await safe_edit(call.message, no_username_warning(), reply_markup=back_to_main_kb())
+        await call.answer("❗ Установите @username!", show_alert=True)
+        return
+
+    await state.update_data(product_type="views")
+    await state.set_state(OrderStates.waiting_for_recipient)
+    await safe_edit(
+        call.message,
+        f"🎁 <b>Подарить просмотры</b>\n{DIV}\n"
+        f"🔎 Введите юзернейм пользователя,\n"
+        f"которому будем дарить просмотры:\n\n"
         f"📌 <i>Пример:</i> <code>@username</code>\n"
         f"{DIV}\n"
         f"⚠️ Пользователь должен был запустить бота."
@@ -788,17 +961,30 @@ async def process_recipient(message: Message, state: FSMContext):
     if product == "stars":
         await state.set_state(OrderStates.choosing_stars)
         await message.answer(grid_text_stars(username), reply_markup=stars_grid_kb())
-    else:
+    elif product == "premium":
         await state.set_state(OrderStates.choosing_premium)
         await message.answer(grid_text_premium(username), reply_markup=premium_grid_kb())
+    else:
+        await state.set_state(OrderStates.choosing_views)
+        await message.answer(grid_text_views(username), reply_markup=views_grid_kb())
 
 
-def payment_text(stars_count: int = 0, premium_plan: str = "", recipient_display: str = "",
-                 is_gift: bool = False, total_price: float = 0.0) -> str:
+def payment_text(stars_count: int = 0, premium_plan: str = "", views_plan: str = "",
+                 views_count: int = 0, recipient_display: str = "", is_gift: bool = False,
+                 total_price: float = 0.0) -> str:
     gift_line = f"\n🎁 Подарок для: <b>{recipient_display}</b>" if is_gift else ""
     if premium_plan:
         plan = PREMIUM_PLANS[premium_plan]
         product_line = f"💎 Telegram Premium — <b>{plan['label']}</b>"
+    elif views_plan:
+        plan = VIEWS_PLANS[views_plan]
+        if views_count and views_count != plan.get("views", 0):
+            product_line = (
+                f"👁 Количество: <b>{fmt_num(views_count)}</b> просмотров\n"
+                f"   Тариф: <i>{plan['short']}</i>"
+            )
+        else:
+            product_line = f"👁 <b>{plan['label']}</b>"
     else:
         product_line = f"⭐ Количество: <b>{fmt_num(stars_count)}</b> звёзд"
 
@@ -910,6 +1096,105 @@ async def select_premium(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+@user_router.callback_query(F.data.startswith("views:"))
+async def select_views(call: CallbackQuery, state: FSMContext):
+    register_user(call.from_user.id, call.from_user.username)
+    if maintenance_mode and not is_admin(call.from_user.id):
+        await call.answer("🔧 Бот на тех. обслуживании", show_alert=True)
+        return
+
+    data = await state.get_data()
+    if not data or "recipient_display" not in data:
+        await call.answer("⚠️ Сессия истекла. Начните заново.", show_alert=True)
+        await safe_edit(
+            call.message,
+            f"⚠️ <b>Сессия истекла</b>\n{DIV}\n"
+            f"Пожалуйста, начните заново.",
+            reply_markup=back_to_main_kb(),
+        )
+        return
+
+    value = call.data.split(":", 1)[1]
+
+    if value == "custom":
+        await state.set_state(OrderStates.waiting_for_custom_views)
+        await safe_edit(
+            call.message,
+            f"⚙️ <b>Своё количество просмотров</b>\n{DIV}\n"
+            f"Введите количество просмотров:\n"
+            f"минимум <b>{fmt_num(MIN_VIEWS)}</b>\n"
+            f"максимум <b>{fmt_num(MAX_VIEWS)}</b>\n"
+            f"{DIV}\n"
+            f"📌 <i>Рекомендуем указывать кратно 1000.</i>",
+        )
+        await call.answer()
+        return
+
+    plan = VIEWS_PLANS.get(value)
+    if not plan:
+        await call.answer("❌ Неизвестный тариф", show_alert=True)
+        return
+
+    total = float(plan["price"])
+
+    await state.update_data(views_plan=value, views_count=0, total_price=total)
+    await state.set_state(OrderStates.waiting_for_screenshot)
+
+    await safe_edit(
+        call.message,
+        payment_text(
+            views_plan=value,
+            recipient_display=data.get("recipient_display", "—"),
+            is_gift=data.get("is_gift", False),
+            total_price=total,
+        ),
+    )
+    await call.answer()
+
+
+@user_router.callback_query(F.data.startswith("views_rate:"))
+async def select_views_rate(call: CallbackQuery, state: FSMContext):
+    register_user(call.from_user.id, call.from_user.username)
+    if maintenance_mode and not is_admin(call.from_user.id):
+        await call.answer("🔧 Бот на тех. обслуживании", show_alert=True)
+        return
+
+    data = await state.get_data()
+    if not data or "recipient_display" not in data or not data.get("views_count"):
+        await call.answer("⚠️ Сессия истекла. Начните заново.", show_alert=True)
+        await safe_edit(
+            call.message,
+            f"⚠️ <b>Сессия истекла</b>\n{DIV}\n"
+            f"Пожалуйста, начните заново.",
+            reply_markup=back_to_main_kb(),
+        )
+        return
+
+    rate_key = call.data.split(":", 1)[1]
+    plan = VIEWS_PLANS.get(rate_key)
+    if not plan:
+        await call.answer("❌ Неизвестный тариф", show_alert=True)
+        return
+
+    views_count = int(data["views_count"])
+    total = calc_views_price(views_count, rate_key)
+
+    await state.update_data(views_plan=rate_key, total_price=total)
+    await state.set_state(OrderStates.waiting_for_screenshot)
+
+    await safe_edit(
+        call.message,
+        payment_text(
+            views_plan=rate_key,
+            views_count=views_count,
+            recipient_display=data.get("recipient_display", "—"),
+            is_gift=data.get("is_gift", False),
+            total_price=total,
+        ),
+    )
+    await call.answer()
+
+
 @user_router.message(OrderStates.waiting_for_custom_amount)
 async def process_custom_amount(message: Message, state: FSMContext):
     register_user(message.from_user.id, message.from_user.username)
@@ -946,6 +1231,48 @@ async def process_custom_amount(message: Message, state: FSMContext):
     )
 
 
+@user_router.message(OrderStates.waiting_for_custom_views)
+async def process_custom_views(message: Message, state: FSMContext):
+    register_user(message.from_user.id, message.from_user.username)
+    if maintenance_mode and not is_admin(message.from_user.id):
+        await message.answer("🔧 Бот на тех. обслуживании. Попробуйте позже.")
+        await state.clear()
+        return
+
+    text = (message.text or "").strip().replace(" ", "").replace(",", "")
+    if not text.isdigit():
+        await message.answer("❌ Пожалуйста, введите целое число.")
+        return
+
+    views_count = int(text)
+    if views_count < MIN_VIEWS:
+        await message.answer(
+            f"❌ Минимум — <b>{fmt_num(MIN_VIEWS)}</b> просмотров.\n"
+            f"Попробуйте снова."
+        )
+        return
+    if views_count > MAX_VIEWS:
+        await message.answer(
+            f"❌ Максимум — <b>{fmt_num(MAX_VIEWS)}</b> просмотров."
+        )
+        return
+
+    data = await state.get_data()
+    if not data or "recipient_display" not in data:
+        await message.answer("⚠️ Сессия истекла. Введите /start.")
+        await state.clear()
+        return
+
+    await state.update_data(views_count=views_count)
+    # состояние пока остаётся waiting_for_custom_views — ждём нажатия кнопки тарифа
+    await message.answer(
+        f"👁 <b>Количество:</b> {fmt_num(views_count)} просмотров\n"
+        f"{DIV}\n"
+        f"🔍 Выберите тариф скорости 👇",
+        reply_markup=views_rate_kb(views_count),
+    )
+
+
 @user_router.message(OrderStates.waiting_for_screenshot, F.photo)
 async def process_screenshot(message: Message, state: FSMContext, bot: Bot):
     register_user(message.from_user.id, message.from_user.username)
@@ -953,6 +1280,8 @@ async def process_screenshot(message: Message, state: FSMContext, bot: Bot):
     product_type = data.get("product_type", "stars")
     stars_count = data.get("stars_count", 0)
     premium_plan = data.get("premium_plan", "")
+    views_plan = data.get("views_plan", "")
+    views_count = data.get("views_count", 0)
     total_price = data.get("total_price", 0.0)
     recipient_username = data.get("recipient_username") or ""
     recipient_id = data.get("recipient_id")
@@ -975,6 +1304,8 @@ async def process_screenshot(message: Message, state: FSMContext, bot: Bot):
         product_type=product_type,
         stars_count=stars_count,
         premium_plan=premium_plan,
+        views_plan=views_plan,
+        views_count=views_count,
         total_price=total_price,
     )
     order.screenshot_file_id = screenshot_file_id
