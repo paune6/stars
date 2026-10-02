@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -58,7 +59,7 @@ START_PHOTO_URL = "https://i.ibb.co/zWbKBYyf/image.png"
 PHOTO_ORDERS    = "https://i.ibb.co/xSPCFp2f/image.png"
 PHOTO_STARS     = "https://i.ibb.co/kghWKtLr/image.png"
 PHOTO_PREMIUM   = "https://i.ibb.co/4whMc7qb/image.png"
-PHOTO_VIEWS     = "https://i.ibb.co/kghWKtLr/image.png"
+PHOTO_VIEWS     = "https://i.ibb.co/hRkXfgj0/2026-10-02-18-36-43.png"
 PHOTO_PROFILE   = "https://i.ibb.co/Ngk3Nx4t/image.png"
 
 logging.basicConfig(level=logging.INFO)
@@ -110,6 +111,32 @@ def check_username(user) -> bool:
     return bool(user.username)
 
 
+# ───────────────────── ВАЛИДАЦИЯ ССЫЛКИ НА ПОСТ ─────────────────────
+
+POST_LINK_RE = re.compile(
+    r"^https?://t\.me/([a-zA-Z0-9_]{3,})/(\d+)(?:\?[^\s]*)?$"
+)
+
+
+def normalize_post_link(text: str) -> Optional[str]:
+    """Принимает https://t.me/user/123, t.me/user/123, @user/123.
+    Возвращает канонический https://t.me/user/123 либо None."""
+    if not text:
+        return None
+    t = text.strip()
+    if t.startswith("@"):
+        t = "https://t.me/" + t[1:]
+    elif t.startswith("t.me/"):
+        t = "https://" + t
+    elif not t.startswith(("http://", "https://")):
+        return None
+
+    m = POST_LINK_RE.match(t)
+    if not m:
+        return None
+    return f"https://t.me/{m.group(1)}/{m.group(2)}"
+
+
 orders: dict[int, "Order"] = {}
 order_counter = 0
 maintenance_mode = False
@@ -142,6 +169,7 @@ class Order:
     premium_plan: str = ""
     views_plan: str = ""
     views_count: int = 0
+    post_link: str = ""
     total_price: float = 0.0
     screenshot_file_id: Optional[str] = None
     status: str = "pending"
@@ -163,7 +191,8 @@ class Order:
 def create_order(user_id: int, username: str, recipient_username: str,
                  recipient_id: Optional[int], is_gift: bool, product_type: str,
                  stars_count: int = 0, premium_plan: str = "", views_plan: str = "",
-                 views_count: int = 0, total_price: float = 0.0) -> Order:
+                 views_count: int = 0, post_link: str = "",
+                 total_price: float = 0.0) -> Order:
     global order_counter
     order_counter += 1
     order = Order(
@@ -178,6 +207,7 @@ def create_order(user_id: int, username: str, recipient_username: str,
         premium_plan=premium_plan,
         views_plan=views_plan,
         views_count=views_count,
+        post_link=post_link,
         total_price=round(total_price, 2),
     )
     orders[order_counter] = order
@@ -225,6 +255,7 @@ class OrderStates(StatesGroup):
     waiting_for_recipient = State()
     waiting_for_custom_amount = State()
     waiting_for_custom_views = State()
+    waiting_for_post_link = State()
     waiting_for_screenshot = State()
 
 
@@ -345,7 +376,7 @@ def views_grid_kb():
             callback_data=f"views:{key}",
         )
     kb.button(text="⚙️ Своё количество", callback_data="views:custom")
-    kb.button(text="⬅️ Назад", callback_data="buy_views")
+    kb.button(text="⬅️ Назад", callback_data="main_menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -358,7 +389,7 @@ def views_rate_kb(views_count: int):
             text=f"👁 {plan['short']} · {fmt_price_value(total)}",
             callback_data=f"views_rate:{key}",
         )
-    kb.button(text="⬅️ Назад", callback_data="buy_views")
+    kb.button(text="⬅️ Назад", callback_data="main_menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -484,6 +515,8 @@ async def rb_buy_premium(message: Message, state: FSMContext):
     )
 
 
+# ─── ПРОСМОТРЫ: сразу запрашиваем ссылку на пост ───
+
 @user_router.message(F.text == "👁 Купить просмотры")
 async def rb_buy_views(message: Message, state: FSMContext):
     await state.clear()
@@ -496,13 +529,44 @@ async def rb_buy_views(message: Message, state: FSMContext):
         await message.answer(no_username_warning(), reply_markup=user_reply_kb())
         return
 
+    await state.set_state(OrderStates.waiting_for_post_link)
+    await state.update_data(product_type="views")
     await message.answer_photo(
         photo=PHOTO_VIEWS,
         caption=(
             f"👁 <b>Покупка просмотров</b>\n{DIV}\n"
-            f"Выберите, кому хотите купить просмотры 👇"
+            f"🔗 Отправьте ссылку на пост, которому\n"
+            f"нужно накрутить просмотры:\n\n"
+            f"📌 <i>Пример:</i> <code>https://t.me/username/123</code>\n"
+            f"{DIV}\n"
+            f"⚠️ Пост должен быть в <b>открытом</b> канале."
         ),
-        reply_markup=buy_type_kb("views"),
+    )
+
+
+@user_router.message(OrderStates.waiting_for_post_link)
+async def process_post_link(message: Message, state: FSMContext):
+    register_user(message.from_user.id, message.from_user.username)
+    if maintenance_mode and not is_admin(message.from_user.id):
+        await message.answer("🔧 Бот на тех. обслуживании. Попробуйте позже.")
+        await state.clear()
+        return
+
+    link = normalize_post_link(message.text or "")
+    if not link:
+        await message.answer(
+            f"❌ <b>Неверная ссылка</b>\n{DIV}\n"
+            f"Отправьте ссылку на пост в формате:\n"
+            f"<code>https://t.me/username/123</code>\n\n"
+            f"Пример: <code>https://t.me/durov/1</code>"
+        )
+        return
+
+    await state.update_data(post_link=link)
+    await state.set_state(OrderStates.choosing_views)
+    await message.answer(
+        grid_text_views(link),
+        reply_markup=views_grid_kb(),
     )
 
 
@@ -523,10 +587,15 @@ async def rb_my_orders(message: Message):
 
     text = f"📋 <b>Мои заявки</b>\n{DIV}\n\n"
     for o in user_orders:
-        gift = f"\n   🎁 Подарок: @{o.recipient_username}" if o.is_gift else ""
+        if o.product_type == "views" and o.post_link:
+            extra = f"\n   🔗 {o.post_link}"
+        elif o.is_gift:
+            extra = f"\n   🎁 Подарок: @{o.recipient_username}"
+        else:
+            extra = ""
         text += (
             f"🆔 <b>Заявка №{o.order_id}</b>\n"
-            f"   {o.product_label} · {fmt_price_value(o.total_price)}{gift}\n"
+            f"   {o.product_label} · {fmt_price_value(o.total_price)}{extra}\n"
             f"   🕐 {o.created_at}\n\n"
         )
 
@@ -558,11 +627,20 @@ async def rb_profile(message: Message):
 
 HELP_TEXT = (
     f"ℹ️ <b>Помощь</b>\n{DIV}\n"
-    f"<b>Как купить:</b>\n"
-    f"1️⃣ Нажмите «⭐ Купить звёзды», «💎 Купить Premium»\n"
-    f"    или «👁 Купить просмотры»\n"
+    f"<b>⭐ Звёзды / 💎 Premium:</b>\n"
+    f"1️⃣ Нажмите «⭐ Купить звёзды» или «💎 Купить Premium»\n"
     f"2️⃣ Выберите «Купить себе» или «Подарить»\n"
-    f"3️⃣ Укажите количество/план/тариф\n"
+    f"3️⃣ Укажите количество/план\n"
+    f"4️⃣ Переведите сумму на номер:\n"
+    f"    <code>{PAYMENT_PHONE}</code>\n"
+    f"5️⃣ Отправьте скриншот перевода боту\n"
+    f"6️⃣ Ожидайте зачисления ⏳\n"
+    f"{DIV}\n"
+    f"<b>👁 Просмотры:</b>\n"
+    f"1️⃣ Нажмите «👁 Купить просмотры»\n"
+    f"2️⃣ Отправьте ссылку на пост\n"
+    f"    (<code>https://t.me/username/123</code>)\n"
+    f"3️⃣ Выберите тариф или «Своё количество»\n"
     f"4️⃣ Переведите сумму на номер:\n"
     f"    <code>{PAYMENT_PHONE}</code>\n"
     f"5️⃣ Отправьте скриншот перевода боту\n"
@@ -696,11 +774,16 @@ async def buy_views(call: CallbackQuery, state: FSMContext):
         await call.answer("❗ Установите @username!", show_alert=True)
         return
 
+    await state.set_state(OrderStates.waiting_for_post_link)
+    await state.update_data(product_type="views")
     await safe_edit(
         call.message,
         f"👁 <b>Покупка просмотров</b>\n{DIV}\n"
-        f"Выберите, кому хотите купить просмотры 👇",
-        reply_markup=buy_type_kb("views"),
+        f"🔗 Отправьте ссылку на пост, которому\n"
+        f"нужно накрутить просмотры:\n\n"
+        f"📌 <i>Пример:</i> <code>https://t.me/username/123</code>\n"
+        f"{DIV}\n"
+        f"⚠️ Пост должен быть в <b>открытом</b> канале.",
         photo=PHOTO_VIEWS,
     )
     await call.answer()
@@ -735,13 +818,14 @@ def grid_text_premium(recipient_display: str) -> str:
     )
 
 
-def grid_text_views(recipient_display: str) -> str:
+def grid_text_views(post_link: str) -> str:
     return (
         f"👁 <b>Покупка просмотров</b>\n"
         f"{DIV}\n"
-        f"👤 Получатель: <b>{recipient_display}</b>\n"
+        f"🔗 Пост: <code>{post_link}</code>\n"
         f"{DIV}\n"
         f"📉 Минимум: <b>{fmt_num(MIN_VIEWS)}</b> просмотров\n"
+        f"📈 Максимум: <b>{fmt_num(MAX_VIEWS)}</b> просмотров\n"
         f"{DIV}\n"
         f"📦 Доступные тарифы:\n"
         f"   👁 1000 просмотров (медленно) — {fmt_price_value(0.18)}\n"
@@ -759,7 +843,6 @@ async def _start_product_flow(call: CallbackQuery, state: FSMContext, product: s
     product_state = {
         "stars": OrderStates.choosing_stars,
         "premium": OrderStates.choosing_premium,
-        "views": OrderStates.choosing_views,
     }
     await state.set_state(product_state[product])
     await state.update_data(
@@ -773,12 +856,9 @@ async def _start_product_flow(call: CallbackQuery, state: FSMContext, product: s
     if product == "stars":
         text = grid_text_stars(display)
         markup = stars_grid_kb()
-    elif product == "premium":
+    else:
         text = grid_text_premium(display)
         markup = premium_grid_kb()
-    else:
-        text = grid_text_views(display)
-        markup = views_grid_kb()
 
     await safe_edit(call.message, text, reply_markup=markup)
     await call.answer()
@@ -812,21 +892,6 @@ async def premium_self(call: CallbackQuery, state: FSMContext):
         return
 
     await _start_product_flow(call, state, "premium")
-
-
-@user_router.callback_query(F.data == "views_self")
-async def views_self(call: CallbackQuery, state: FSMContext):
-    register_user(call.from_user.id, call.from_user.username)
-    if maintenance_mode and not is_admin(call.from_user.id):
-        await call.answer("🔧 Бот на тех. обслуживании", show_alert=True)
-        return
-
-    if not check_username(call.from_user):
-        await safe_edit(call.message, no_username_warning(), reply_markup=back_to_main_kb())
-        await call.answer("❗ Установите @username!", show_alert=True)
-        return
-
-    await _start_product_flow(call, state, "views")
 
 
 @user_router.callback_query(F.data == "stars_gift")
@@ -874,32 +939,6 @@ async def premium_gift(call: CallbackQuery, state: FSMContext):
         f"🎁 <b>Подарить Premium</b>\n{DIV}\n"
         f"🔎 Введите юзернейм пользователя,\n"
         f"которому будем дарить Premium:\n\n"
-        f"📌 <i>Пример:</i> <code>@username</code>\n"
-        f"{DIV}\n"
-        f"⚠️ Пользователь должен был запустить бота."
-    )
-    await call.answer()
-
-
-@user_router.callback_query(F.data == "views_gift")
-async def views_gift(call: CallbackQuery, state: FSMContext):
-    register_user(call.from_user.id, call.from_user.username)
-    if maintenance_mode and not is_admin(call.from_user.id):
-        await call.answer("🔧 Бот на тех. обслуживании", show_alert=True)
-        return
-
-    if not check_username(call.from_user):
-        await safe_edit(call.message, no_username_warning(), reply_markup=back_to_main_kb())
-        await call.answer("❗ Установите @username!", show_alert=True)
-        return
-
-    await state.update_data(product_type="views")
-    await state.set_state(OrderStates.waiting_for_recipient)
-    await safe_edit(
-        call.message,
-        f"🎁 <b>Подарить просмотры</b>\n{DIV}\n"
-        f"🔎 Введите юзернейм пользователя,\n"
-        f"которому будем дарить просмотры:\n\n"
         f"📌 <i>Пример:</i> <code>@username</code>\n"
         f"{DIV}\n"
         f"⚠️ Пользователь должен был запустить бота."
@@ -965,26 +1004,27 @@ async def process_recipient(message: Message, state: FSMContext):
         await state.set_state(OrderStates.choosing_premium)
         await message.answer(grid_text_premium(username), reply_markup=premium_grid_kb())
     else:
-        await state.set_state(OrderStates.choosing_views)
-        await message.answer(grid_text_views(username), reply_markup=views_grid_kb())
+        await message.answer("⚠️ Произошла ошибка. Начните заново /start")
+        await state.clear()
 
 
 def payment_text(stars_count: int = 0, premium_plan: str = "", views_plan: str = "",
                  views_count: int = 0, recipient_display: str = "", is_gift: bool = False,
-                 total_price: float = 0.0) -> str:
+                 total_price: float = 0.0, post_link: str = "") -> str:
     gift_line = f"\n🎁 Подарок для: <b>{recipient_display}</b>" if is_gift else ""
     if premium_plan:
         plan = PREMIUM_PLANS[premium_plan]
         product_line = f"💎 Telegram Premium — <b>{plan['label']}</b>"
     elif views_plan:
         plan = VIEWS_PLANS[views_plan]
+        link_line = f"\n🔗 Пост: <code>{post_link}</code>" if post_link else ""
         if views_count and views_count != plan.get("views", 0):
             product_line = (
                 f"👁 Количество: <b>{fmt_num(views_count)}</b> просмотров\n"
-                f"   Тариф: <i>{plan['short']}</i>"
+                f"   Тариф: <i>{plan['short']}</i>{link_line}"
             )
         else:
-            product_line = f"👁 <b>{plan['label']}</b>"
+            product_line = f"👁 <b>{plan['label']}</b>{link_line}"
     else:
         product_line = f"⭐ Количество: <b>{fmt_num(stars_count)}</b> звёзд"
 
@@ -1104,7 +1144,7 @@ async def select_views(call: CallbackQuery, state: FSMContext):
         return
 
     data = await state.get_data()
-    if not data or "recipient_display" not in data:
+    if not data or "post_link" not in data:
         await call.answer("⚠️ Сессия истекла. Начните заново.", show_alert=True)
         await safe_edit(
             call.message,
@@ -1121,6 +1161,8 @@ async def select_views(call: CallbackQuery, state: FSMContext):
         await safe_edit(
             call.message,
             f"⚙️ <b>Своё количество просмотров</b>\n{DIV}\n"
+            f"🔗 Пост: <code>{data['post_link']}</code>\n"
+            f"{DIV}\n"
             f"Введите количество просмотров:\n"
             f"минимум <b>{fmt_num(MIN_VIEWS)}</b>\n"
             f"максимум <b>{fmt_num(MAX_VIEWS)}</b>\n"
@@ -1144,8 +1186,7 @@ async def select_views(call: CallbackQuery, state: FSMContext):
         call.message,
         payment_text(
             views_plan=value,
-            recipient_display=data.get("recipient_display", "—"),
-            is_gift=data.get("is_gift", False),
+            post_link=data["post_link"],
             total_price=total,
         ),
     )
@@ -1160,7 +1201,7 @@ async def select_views_rate(call: CallbackQuery, state: FSMContext):
         return
 
     data = await state.get_data()
-    if not data or "recipient_display" not in data or not data.get("views_count"):
+    if not data or "post_link" not in data or not data.get("views_count"):
         await call.answer("⚠️ Сессия истекла. Начните заново.", show_alert=True)
         await safe_edit(
             call.message,
@@ -1187,8 +1228,7 @@ async def select_views_rate(call: CallbackQuery, state: FSMContext):
         payment_text(
             views_plan=rate_key,
             views_count=views_count,
-            recipient_display=data.get("recipient_display", "—"),
-            is_gift=data.get("is_gift", False),
+            post_link=data["post_link"],
             total_price=total,
         ),
     )
@@ -1258,15 +1298,15 @@ async def process_custom_views(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    if not data or "recipient_display" not in data:
+    if not data or "post_link" not in data:
         await message.answer("⚠️ Сессия истекла. Введите /start.")
         await state.clear()
         return
 
     await state.update_data(views_count=views_count)
-    # состояние пока остаётся waiting_for_custom_views — ждём нажатия кнопки тарифа
     await message.answer(
         f"👁 <b>Количество:</b> {fmt_num(views_count)} просмотров\n"
+        f"🔗 Пост: <code>{data['post_link']}</code>\n"
         f"{DIV}\n"
         f"🔍 Выберите тариф скорости 👇",
         reply_markup=views_rate_kb(views_count),
@@ -1282,6 +1322,7 @@ async def process_screenshot(message: Message, state: FSMContext, bot: Bot):
     premium_plan = data.get("premium_plan", "")
     views_plan = data.get("views_plan", "")
     views_count = data.get("views_count", 0)
+    post_link = data.get("post_link", "")
     total_price = data.get("total_price", 0.0)
     recipient_username = data.get("recipient_username") or ""
     recipient_id = data.get("recipient_id")
@@ -1306,14 +1347,20 @@ async def process_screenshot(message: Message, state: FSMContext, bot: Bot):
         premium_plan=premium_plan,
         views_plan=views_plan,
         views_count=views_count,
+        post_link=post_link,
         total_price=total_price,
     )
     order.screenshot_file_id = screenshot_file_id
 
-    gift_line = f"\n🎁 Подарок для: <b>{recipient_display}</b>" if is_gift else ""
+    if product_type == "views" and post_link:
+        extra_line = f"\n🔗 Пост: <code>{post_link}</code>"
+    elif is_gift:
+        extra_line = f"\n🎁 Подарок для: <b>{recipient_display}</b>"
+    else:
+        extra_line = ""
 
     await message.answer(
-        f"✅ <b>Заявка №{order.order_id} создана!</b>{gift_line}\n"
+        f"✅ <b>Заявка №{order.order_id} создана!</b>{extra_line}\n"
         f"{DIV}\n"
         f"{order.product_label}\n"
         f"💰 Сумма: <b>{fmt_price_value(order.total_price)}</b>\n"
@@ -1324,6 +1371,7 @@ async def process_screenshot(message: Message, state: FSMContext, bot: Bot):
     )
 
     gift_admin = f"\n🎁 Подарок для: {recipient_display}" if is_gift else ""
+    link_admin = f"\n🔗 Пост: <code>{post_link}</code>" if post_link else ""
 
     for admin_id in ADMIN_IDS:
         try:
@@ -1334,6 +1382,7 @@ async def process_screenshot(message: Message, state: FSMContext, bot: Bot):
                     f"🆕 <b>Новая заявка №{order.order_id}</b>\n"
                     f"{DIV}\n"
                     f"📦 Товар: {order.product_label}\n"
+                    f"{link_admin.lstrip() + chr(10) if link_admin else ''}"
                     f"👤 Покупатель: @{order.username}\n"
                     f"🆔 ID: <code>{order.user_id}</code>{gift_admin}\n"
                     f"💰 Сумма: <b>{fmt_price_value(order.total_price)}</b>\n"
@@ -1377,10 +1426,15 @@ async def my_orders(call: CallbackQuery):
 
     text = f"📋 <b>Мои заявки</b>\n{DIV}\n\n"
     for o in user_orders:
-        gift = f"\n   🎁 Подарок: @{o.recipient_username}" if o.is_gift else ""
+        if o.product_type == "views" and o.post_link:
+            extra = f"\n   🔗 {o.post_link}"
+        elif o.is_gift:
+            extra = f"\n   🎁 Подарок: @{o.recipient_username}"
+        else:
+            extra = ""
         text += (
             f"🆔 <b>Заявка №{o.order_id}</b>\n"
-            f"   {o.product_label} · {fmt_price_value(o.total_price)}{gift}\n"
+            f"   {o.product_label} · {fmt_price_value(o.total_price)}{extra}\n"
             f"   🕐 {o.created_at}\n\n"
         )
 
@@ -1489,12 +1543,17 @@ async def aorders_cmd(message: Message):
 
     text = f"📋 <b>Активные заявки ({len(pending)})</b>\n{DIV}\n\n"
     for o in pending:
-        gift = f"\n   🎁 → @{o.recipient_username}" if o.is_gift else ""
+        if o.product_type == "views" and o.post_link:
+            extra = f"\n   🔗 {o.post_link}"
+        elif o.is_gift:
+            extra = f"\n   🎁 → @{o.recipient_username}"
+        else:
+            extra = ""
         text += (
             f"🆔 <b>№{o.order_id}</b>\n"
             f"   📦 {o.product_label}\n"
             f"   💰 {fmt_price_value(o.total_price)}\n"
-            f"   👤 @{o.username} (<code>{o.user_id}</code>){gift}\n"
+            f"   👤 @{o.username} (<code>{o.user_id}</code>){extra}\n"
             f"   🕐 {o.created_at}\n"
             f"   ✅ <code>/accept {o.order_id}</code>\n"
             f"   ❌ <code>/reject {o.order_id}</code>\n\n"
@@ -1567,13 +1626,16 @@ async def accept_cmd(message: Message, bot: Bot):
     recipient_id = order.recipient_id
     is_gift = order.is_gift
     label = order.product_label
+    post_link = order.post_link
     accept_order(order_id)
+
+    extra_buyer = f"\n🔗 Пост: <code>{post_link}</code>" if post_link else ""
 
     try:
         await bot.send_message(
             buyer_id,
             f"🎉 <b>Заявка №{order_id} принята!</b>\n{DIV}\n"
-            f"{label}\n"
+            f"{label}{extra_buyer}\n"
             f"⏳ Будет выполнено в ближайшее время.\n"
             f"{DIV}\n"
             f"💛 Спасибо за покупку!",
@@ -1739,13 +1801,20 @@ async def admin_list_orders(call: CallbackQuery, bot: Bot):
     )
 
     for order in pending:
-        gift_line = f"\n🎁 Подарок для: @{order.recipient_username}" if order.is_gift else ""
+        if order.product_type == "views" and order.post_link:
+            extra_line = f"\n🔗 Пост: <code>{order.post_link}</code>"
+        elif order.is_gift:
+            extra_line = f"\n🎁 Подарок для: @{order.recipient_username}"
+        else:
+            extra_line = ""
+
         caption = (
             f"🆔 <b>Заявка №{order.order_id}</b>\n"
             f"{DIV}\n"
-            f"📦 Товар: {order.product_label}\n"
+            f"📦 Товар: {order.product_label}"
+            f"{extra_line}\n"
             f"👤 Покупатель: @{order.username}\n"
-            f"🆔 ID: <code>{order.user_id}</code>{gift_line}\n"
+            f"🆔 ID: <code>{order.user_id}</code>\n"
             f"💰 Сумма: <b>{fmt_price_value(order.total_price)}</b>\n"
             f"🕐 Создана: {order.created_at}"
         )
@@ -1790,13 +1859,16 @@ async def admin_accept(call: CallbackQuery, bot: Bot):
     recipient_id = order.recipient_id
     is_gift = order.is_gift
     label = order.product_label
+    post_link = order.post_link
     accept_order(order_id)
+
+    extra_buyer = f"\n🔗 Пост: <code>{post_link}</code>" if post_link else ""
 
     try:
         await bot.send_message(
             buyer_id,
             f"🎉 <b>Заявка №{order_id} принята!</b>\n{DIV}\n"
-            f"{label}\n"
+            f"{label}{extra_buyer}\n"
             f"⏳ Будет выполнено в ближайшее время.\n"
             f"{DIV}\n"
             f"💛 Спасибо за покупку!",
